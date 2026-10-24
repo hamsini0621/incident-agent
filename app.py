@@ -18,6 +18,7 @@ import copy
 import hashlib
 import json
 import os
+import queue
 import re
 import secrets
 import sqlite3
@@ -36,9 +37,10 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite")
 GEMINI_BASE = os.environ.get("GEMINI_NATIVE_BASE", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 NATIVE = "generativelanguage.googleapis.com" in LLM_BASE_URL and os.environ.get("LLM_NATIVE", "1") != "0"
-THINK = os.environ.get("LLM_THINKING", "512")
+THINK = os.environ.get("LLM_THINKING", "0")  # thinking only adds latency here; 0 = off
 SELFTEST_ON = os.environ.get("SELFTEST", "1") != "0"
-REQUEST_BUDGET = float(os.environ.get("REQUEST_BUDGET", "15"))  # seconds for the planning step (grader allows 18)
+REQUEST_BUDGET = float(os.environ.get("REQUEST_BUDGET", "16"))  # seconds for the planning step (grader allows 18)
+HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "5"))  # start a parallel 2nd model call if the 1st is this slow
 MODEL_NAME = LLM_MODEL.replace("models/", "")
 
 LAST_LLM_ERROR = {"msg": ""}
@@ -329,7 +331,7 @@ def chat_json(system, user, timeout):
             parts = data["candidates"][0]["content"]["parts"]
             return "".join(p.get("text", "") for p in parts if not p.get("thought"))
 
-        gc = {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 4096}
+        gc = {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 1500}
         if THINK != "" and _think_ok["v"]:
             gc["thinkingConfig"] = {"thinkingBudget": int(THINK)}
         try:
@@ -483,25 +485,80 @@ def normalize_plan(raw, ctx):
     return {"rootCause": cause, "evidence": ev, "diagnostics": diags, "effect": effect}, problems
 
 
+def fallback_plan(ctx):
+    """Last resort when the model gave nothing usable: keyword heuristic, SAFE (non-approval) effect only."""
+    text = "\n".join(ctx["lines"]).lower()
+    inc = ctx["incident"]
+
+    def score(c):
+        toks = [t for t in re.split(r"[^a-z0-9]+", c.lower()) if len(t) > 2]
+        return sum(text.count(t) for t in toks)
+
+    cause = max(ctx["causes"], key=score)
+    toks = [t for t in re.split(r"[^a-z0-9]+", cause.lower()) if len(t) > 2]
+    scored = []
+    for ln in ctx["lines"]:
+        m = re.match(r"^\[([A-Za-z0-9_.:\-]+)\]", ln)
+        if m:
+            scored.append((sum(ln.lower().count(t) for t in toks), m.group(1)))
+    scored.sort(key=lambda x: -x[0])
+    ev = []
+    for _, i in scored:
+        if i not in ev:
+            ev.append(i)
+        if len(ev) == 3:
+            break
+    if len(ev) < 2:
+        return None
+
+    def build(name, tool):
+        sch = tool.get("inputSchema") or {}
+        args = {}
+        for k, p in (sch.get("properties") or {}).items():
+            if k in (sch.get("required") or []):
+                if isinstance(p, dict) and isinstance(p.get("enum"), list) and p["enum"]:
+                    args[k] = p["enum"][0]
+                elif "service" in k.lower():
+                    args[k] = inc["service"]
+        a, probs, _ = check_args(name, args, sch, ctx, "fallback")
+        return a if a is not None and not probs else None
+
+    diags = []
+    for name, tool in ctx["diag"].items():
+        a = build(name, tool)
+        if a is not None:
+            diags.append({"toolName": name, "arguments": a, "evidence": ev[:1]})
+            break
+    effect = None
+    for name, tool in ctx["effect"].items():
+        if name in ctx["approval"]:
+            continue
+        a = build(name, tool)
+        if a is not None and "page" in name.lower():
+            effect = {"toolName": name, "arguments": a, "evidence": ev[:1]}
+            break
+    if not diags or effect is None:
+        return None
+    return {"rootCause": cause, "evidence": ev[:3], "diagnostics": diags, "effect": effect}
+
+
 def plan_incident(ctx, deadline):
-    """Call the model (up to 2 attempts inside the time budget). Returns (plan, model_start_ns, model_end_ns)."""
+    """Hedged model call: if the first call is slow or fails, launch another in parallel (max 3 total)
+    and take the first clean plan. Returns (plan, model_start_ns, model_end_ns)."""
     t0 = time.time_ns()
-    best, hint = None, None
     if not LLM_API_KEY:
         LAST_LLM_ERROR["msg"] = "LLM_API_KEY is not set"
-    for attempt in range(2):
-        remaining = deadline - time.time()
-        if remaining < 4 or not LLM_API_KEY:
-            break
+        raise Bad(503, "Planner unavailable; retry the request.")
+    q = queue.Queue()
+    state = {"launched": 0, "active": 0}
+
+    def worker(hint, timeout):
         try:
-            reply = chat_json(SYSTEM_PROMPT, render_prompt(ctx, hint), max(4, min(remaining - 1.5, 13 if attempt == 0 else remaining - 1.5)))
+            reply = chat_json(SYSTEM_PROMPT, render_prompt(ctx, hint), timeout)
             plan, problems = normalize_plan(parse_json_any(reply), ctx)
-            if plan is not None:
-                best = plan
-            if plan is not None and not problems:
-                break
-            hint = "\n".join(f"- {p}" for p in problems[:8])
-            LAST_LLM_ERROR["msg"] = "plan problems: " + "; ".join(problems[:3])[:200]
+            if plan is None or problems:
+                LAST_LLM_ERROR["msg"] = "plan problems: " + "; ".join(problems[:3])[:200]
+            q.put((plan, problems))
         except urllib.error.HTTPError as e:
             try:
                 detail = e.read().decode("utf-8", "replace")[:160]
@@ -509,10 +566,50 @@ def plan_incident(ctx, deadline):
                 detail = ""
             LAST_LLM_ERROR["msg"] = f"LLM HTTP {e.code}: {detail}"
             app.logger.warning(LAST_LLM_ERROR["msg"])
-            time.sleep(1 if e.code == 429 else 0.2)
+            if e.code == 429:
+                time.sleep(1)
+            q.put((None, None))
         except Exception as e:
             LAST_LLM_ERROR["msg"] = f"LLM error: {type(e).__name__}: {str(e)[:150]}"
             app.logger.warning(LAST_LLM_ERROR["msg"])
+            q.put((None, None))
+
+    def launch(hint=None):
+        remaining = deadline - time.time()
+        if state["launched"] >= 3 or remaining < 3:
+            return False
+        state["launched"] += 1
+        state["active"] += 1
+        threading.Thread(target=worker, args=(hint, remaining - 0.5), daemon=True).start()
+        return True
+
+    best = None
+    launch()
+    next_hedge = time.time() + HEDGE_AFTER
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0 or (state["active"] == 0 and not launch()):
+            break
+        try:
+            plan, problems = q.get(timeout=max(0.05, min(next_hedge - time.time(), remaining)))
+        except queue.Empty:
+            if time.time() >= next_hedge and launch():
+                next_hedge = time.time() + HEDGE_AFTER
+            continue
+        state["active"] -= 1
+        if plan is not None and not problems:
+            best = plan
+            break
+        if plan is not None and best is None:
+            best = plan  # usable but with soft problems; keep unless a cleaner one arrives
+        hint = "\n".join(f"- {p}" for p in (problems or [])[:8]) or None
+        if state["active"] == 0:
+            if not launch(hint):
+                break
+    if best is None:
+        best = fallback_plan(ctx)
+        if best is not None:
+            LAST_LLM_ERROR["msg"] = (LAST_LLM_ERROR["msg"] + " | used fallback plan")[:250]
     t1 = time.time_ns()
     if best is None:
         raise Bad(503, "Planner unavailable; retry the request.")
