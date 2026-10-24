@@ -45,7 +45,7 @@ MODEL_NAME = LLM_MODEL.replace("models/", "")
 
 LAST_LLM_ERROR = {"msg": ""}
 RECENT_ERRORS = []  # last few model errors, shown by /selftest
-BUILD = "hedged-v2"
+BUILD = "vote-v3"
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
@@ -298,6 +298,7 @@ Do three things.
    - If the service is ALREADY at its permitted scaling limit (maximum replicas/ceiling reached), do not scale; page the owner/on-call instead.
    - A rollback or feature disable must target exactly the deployment/feature the evidence blames, not a decoy, an older release, or another service.
    - Do not pick a destructive effect when a safer permitted effect resolves the cause.
+   - ROLLBACK TARGET: rollback_deployment must name the BAD deployment that the evidence blames: the release that was just rolled out and whose rollout lines up with the errors. NEVER name the "previous", "prior", "older", "last known good" or "stable" release: that one is where we go back TO, not what we roll back. Before answering, confirm the deployment id you chose is the one described as rolled out right before the failure.
 Every diagnostic and the effect must cite at least one evidence id, taken from your diagnosis evidence list.
 
 Reply with ONE JSON object only, exactly this shape:
@@ -544,9 +545,41 @@ def fallback_plan(ctx):
     return {"rootCause": cause, "evidence": ev[:3], "diagnostics": diags, "effect": effect}
 
 
+SC_WAIT = float(os.environ.get("SC_WAIT", "9"))  # max seconds to wait for the voting round
+DECOY = re.compile(r"previous|prior|older|stable for|last known|known[- ]good|superseded|stale", re.I)
+ID_LIKE = re.compile(r"[A-Za-z][A-Za-z0-9]*[-_][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*")
+
+
+def decoy_penalty(plan, ctx):
+    """1 per effect argument that looks like an id whose every transcript mention is a 'previous/stable/older' line."""
+    pen = 0
+    for _, v in leaves(plan["effect"]["arguments"]):
+        if isinstance(v, str) and ID_LIKE.fullmatch(v):
+            ls = [ln for ln in ctx["lines"] if v in ln]
+            if ls and all(DECOY.search(ln) for ln in ls):
+                pen += 1
+    return pen
+
+
+def plan_key(p):
+    return canon([p["rootCause"], p["effect"]["toolName"], p["effect"]["arguments"]])
+
+
+def pick_by_vote(results, ctx):
+    """results: [(plan, problems)] in arrival order. Majority on (cause, effect, effect args); decoy targets are penalised."""
+    clean = [r for r in results if not r[1]] or results
+    groups = {}
+    for i, (p, pr) in enumerate(clean):
+        g = groups.setdefault(plan_key(p), {"n": 0, "first": i, "pen": decoy_penalty(p, ctx), "members": []})
+        g["n"] += 1
+        g["members"].append((len(pr), i, p))
+    best = max(groups.values(), key=lambda g: (g["n"] - 3 * g["pen"], -g["first"]))
+    return sorted(best["members"], key=lambda m: (m[0], m[1]))[0][2]
+
+
 def plan_incident(ctx, deadline):
-    """Hedged model call: if the first call is slow or fails, launch another in parallel (max 3 total)
-    and take the first clean plan. Returns (plan, model_start_ns, model_end_ns)."""
+    """Self-consistency: run 3 planner calls in parallel and majority-vote on cause + effect. If none is usable,
+    retry (with the problems as a hint) until the deadline, then fall back. Returns (plan, model_start_ns, model_end_ns)."""
     t0 = time.time_ns()
     if not LLM_API_KEY:
         LAST_LLM_ERROR["msg"] = "LLM_API_KEY is not set"
@@ -560,7 +593,7 @@ def plan_incident(ctx, deadline):
             plan, problems = normalize_plan(parse_json_any(reply), ctx)
             if plan is None or problems:
                 LAST_LLM_ERROR["msg"] = "plan problems: " + "; ".join(problems[:3])[:200]
-            q.put((plan, problems))
+            q.put((plan, problems, None))
         except urllib.error.HTTPError as e:
             try:
                 detail = e.read().decode("utf-8", "replace")[:160]
@@ -571,45 +604,56 @@ def plan_incident(ctx, deadline):
             app.logger.warning(LAST_LLM_ERROR["msg"])
             if e.code == 429:
                 time.sleep(1)
-            q.put((None, None))
+            q.put((None, None, "http"))
         except Exception as e:
             LAST_LLM_ERROR["msg"] = f"LLM error: {type(e).__name__}: {str(e)[:150]}"
             RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
             app.logger.warning(LAST_LLM_ERROR["msg"])
-            q.put((None, None))
+            q.put((None, None, "err"))
 
     def launch(hint=None):
         remaining = deadline - time.time()
-        if state["launched"] >= 3 or remaining < 3:
+        if state["launched"] >= 6 or remaining < 3:
             return False
         state["launched"] += 1
         state["active"] += 1
         threading.Thread(target=worker, args=(hint, remaining - 0.5), daemon=True).start()
         return True
 
-    best = None
-    launch()
-    next_hedge = time.time() + HEDGE_AFTER
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0 or (state["active"] == 0 and not launch()):
+    results, last_problems = [], None
+
+    def collect(until, stop_on_majority):
+        while state["active"] > 0:
+            wait = until - time.time()
+            if wait <= 0:
+                return
+            try:
+                plan, problems, _ = q.get(timeout=wait)
+            except queue.Empty:
+                return
+            state["active"] -= 1
+            nonlocal last_problems
+            if plan is not None:
+                results.append((plan, problems))
+                if stop_on_majority:
+                    counts = {}
+                    for p, pr in results:
+                        if not pr:
+                            counts[plan_key(p)] = counts.get(plan_key(p), 0) + 1
+                    if counts and max(counts.values()) >= 2:
+                        return
+            elif problems:
+                last_problems = problems
+
+    for _ in range(3):
+        launch()
+    collect(min(deadline - 1.0, time.time() + SC_WAIT), True)
+    while not results and time.time() < deadline - 3:
+        hint = "\n".join(f"- {p}" for p in (last_problems or [])[:8]) or None
+        if state["active"] == 0 and not launch(hint):
             break
-        try:
-            plan, problems = q.get(timeout=max(0.05, min(next_hedge - time.time(), remaining)))
-        except queue.Empty:
-            if time.time() >= next_hedge and launch():
-                next_hedge = time.time() + HEDGE_AFTER
-            continue
-        state["active"] -= 1
-        if plan is not None and not problems:
-            best = plan
-            break
-        if plan is not None and best is None:
-            best = plan  # usable but with soft problems; keep unless a cleaner one arrives
-        hint = "\n".join(f"- {p}" for p in (problems or [])[:8]) or None
-        if state["active"] == 0:
-            if not launch(hint):
-                break
+        collect(deadline - 0.5, False)
+    best = pick_by_vote(results, ctx) if results else None
     if best is None:
         best = fallback_plan(ctx)
         if best is not None:
