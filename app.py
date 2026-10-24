@@ -42,10 +42,13 @@ SELFTEST_ON = os.environ.get("SELFTEST", "1") != "0"
 REQUEST_BUDGET = float(os.environ.get("REQUEST_BUDGET", "16"))  # seconds for the planning step (grader allows 18)
 HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "5"))  # start a parallel 2nd model call if the 1st is this slow
 MODEL_NAME = LLM_MODEL.replace("models/", "")
+# Votes are spread across these models so one overloaded model cannot take the planner down.
+_fb = os.environ.get("LLM_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash" if "generativelanguage.googleapis.com" in LLM_BASE_URL else "")
+MODELS = [MODEL_NAME] + [m.strip().replace("models/", "") for m in _fb.split(",") if m.strip() and m.strip().replace("models/", "") != MODEL_NAME]
 
 LAST_LLM_ERROR = {"msg": ""}
 RECENT_ERRORS = []  # last few model errors, shown by /selftest
-BUILD = "vote-v3"
+BUILD = "vote-v4"
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
@@ -318,16 +321,17 @@ def parse_json_any(content):
         return json.loads(m.group(0))
 
 
-_think_ok = {"v": True}
+_think_ok = {}
 
 
-def chat_json(system, user, timeout):
+def chat_json(system, user, timeout, model=None):
     """Return the model's reply text. Gemini-native for Google keys, otherwise OpenAI-compatible."""
+    model = model or MODEL_NAME
     if NATIVE:
         def call(gc):
             body = {"systemInstruction": {"parts": [{"text": system}]},
                     "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": gc}
-            req = urllib.request.Request(f"{GEMINI_BASE}/models/{MODEL_NAME}:generateContent", data=json.dumps(body).encode(),
+            req = urllib.request.Request(f"{GEMINI_BASE}/models/{model}:generateContent", data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json", "x-goog-api-key": LLM_API_KEY})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = json.loads(r.read())
@@ -335,17 +339,17 @@ def chat_json(system, user, timeout):
             return "".join(p.get("text", "") for p in parts if not p.get("thought"))
 
         gc = {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 1500}
-        if THINK != "" and _think_ok["v"]:
+        if THINK != "" and _think_ok.get(model, True):
             gc["thinkingConfig"] = {"thinkingBudget": int(THINK)}
         try:
             return call(gc)
         except urllib.error.HTTPError as e:
             if e.code == 400 and "thinkingConfig" in gc:  # this model rejects a thinking budget: drop it for good
-                _think_ok["v"] = False
+                _think_ok[model] = False
                 gc.pop("thinkingConfig")
                 return call(gc)
             raise
-    payload = {"model": LLM_MODEL, "temperature": 0,
+    payload = {"model": model if model != MODEL_NAME else LLM_MODEL, "temperature": 0,
                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                "response_format": {"type": "json_object"}}
     req = urllib.request.Request(LLM_BASE_URL + "/chat/completions", data=json.dumps(payload).encode(),
@@ -587,37 +591,46 @@ def plan_incident(ctx, deadline):
     q = queue.Queue()
     state = {"launched": 0, "active": 0}
 
-    def worker(hint, timeout):
-        try:
-            reply = chat_json(SYSTEM_PROMPT, render_prompt(ctx, hint), timeout)
-            plan, problems = normalize_plan(parse_json_any(reply), ctx)
-            if plan is None or problems:
-                LAST_LLM_ERROR["msg"] = "plan problems: " + "; ".join(problems[:3])[:200]
-            q.put((plan, problems, None))
-        except urllib.error.HTTPError as e:
+    def worker(hint, timeout, model):
+        t_end = time.time() + timeout
+        for attempt in range(2):
             try:
-                detail = e.read().decode("utf-8", "replace")[:160]
-            except Exception:
-                detail = ""
-            LAST_LLM_ERROR["msg"] = f"LLM HTTP {e.code}: {detail}"
-            RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
-            app.logger.warning(LAST_LLM_ERROR["msg"])
-            if e.code == 429:
-                time.sleep(1)
-            q.put((None, None, "http"))
-        except Exception as e:
-            LAST_LLM_ERROR["msg"] = f"LLM error: {type(e).__name__}: {str(e)[:150]}"
-            RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
-            app.logger.warning(LAST_LLM_ERROR["msg"])
-            q.put((None, None, "err"))
+                kw = {} if model == MODEL_NAME else {"model": model}
+                reply = chat_json(SYSTEM_PROMPT, render_prompt(ctx, hint), max(2, t_end - time.time()), **kw)
+                plan, problems = normalize_plan(parse_json_any(reply), ctx)
+                if plan is None or problems:
+                    LAST_LLM_ERROR["msg"] = "plan problems: " + "; ".join(problems[:3])[:200]
+                if plan is not None:
+                    plan["model"] = model
+                q.put((plan, problems, None))
+                return
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:160]
+                except Exception:
+                    detail = ""
+                LAST_LLM_ERROR["msg"] = f"LLM HTTP {e.code} ({model}): {detail}"
+                RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
+                app.logger.warning(LAST_LLM_ERROR["msg"])
+                if e.code in (429, 503) and attempt == 0 and t_end - time.time() > 6:
+                    time.sleep(1)
+                    continue
+                break
+            except Exception as e:
+                LAST_LLM_ERROR["msg"] = f"LLM error ({model}): {type(e).__name__}: {str(e)[:150]}"
+                RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
+                app.logger.warning(LAST_LLM_ERROR["msg"])
+                break
+        q.put((None, None, "err"))
 
     def launch(hint=None):
         remaining = deadline - time.time()
         if state["launched"] >= 6 or remaining < 3:
             return False
+        model = MODELS[state["launched"] % len(MODELS)]
         state["launched"] += 1
         state["active"] += 1
-        threading.Thread(target=worker, args=(hint, remaining - 0.5), daemon=True).start()
+        threading.Thread(target=worker, args=(hint, remaining - 0.5, model), daemon=True).start()
         return True
 
     results, last_problems = [], None
@@ -745,7 +758,7 @@ def new_action(run, phase, spec, tag):
 def build_run(body, plan, trace_in, t_req, tm0, tm1):
     trace_id, parent, tracestate = trace_in
     run = {"runId": body["runId"], "agentName": body["agentName"], "publicMarker": body["publicMarker"],
-           "status": "waiting", "phase": "diagnostics", "clock": tm1, "ids": [], "model": MODEL_NAME,
+           "status": "waiting", "phase": "diagnostics", "clock": tm1, "ids": [], "model": plan.get("model") or MODEL_NAME,
            "startNs": t_req, "modelStartNs": tm0, "modelEndNs": tm1,
            "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
            "plan": plan, "actions": {}, "actionOrder": [], "actionLog": [], "receiptLog": [],
@@ -1127,14 +1140,14 @@ def selftest():
     used_fallback = False
     try:
         plan, _, _ = plan_incident(ctx, time.time() + REQUEST_BUDGET)
-        out = {"ok": True, "rootCause": plan["rootCause"], "evidence": plan["evidence"],
+        out = {"ok": True, "usedModel": plan.get("model"), "rootCause": plan["rootCause"], "evidence": plan["evidence"],
                "diagnostics": [{"toolName": d["toolName"], "arguments": d["arguments"]} for d in plan["diagnostics"]],
                "effect": {"toolName": plan["effect"]["toolName"], "arguments": plan["effect"]["arguments"]}}
         out["looksRight"] = (plan["rootCause"] == "bad_deployment" and plan["effect"]["toolName"] == "rollback_deployment"
                              and plan["effect"]["arguments"].get("deploymentId") == "deploy-8841")
     except Bad as e:
         out = {"ok": False, "problem": e.message}
-    out.update({"keySet": bool(LLM_API_KEY), "model": MODEL_NAME, "seconds": round(time.time() - t0, 1),
+    out.update({"keySet": bool(LLM_API_KEY), "model": MODEL_NAME, "models": MODELS, "usedModel": out.get("usedModel"), "seconds": round(time.time() - t0, 1),
                 "lastError": LAST_LLM_ERROR["msg"],
                 "recentErrors": RECENT_ERRORS, "big": big, "build": BUILD,
                 "promptChars": len(render_prompt(ctx))})
