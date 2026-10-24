@@ -44,6 +44,8 @@ HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "5"))  # start a parallel 2nd 
 MODEL_NAME = LLM_MODEL.replace("models/", "")
 
 LAST_LLM_ERROR = {"msg": ""}
+RECENT_ERRORS = []  # last few model errors, shown by /selftest
+BUILD = "hedged-v2"
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
@@ -565,12 +567,14 @@ def plan_incident(ctx, deadline):
             except Exception:
                 detail = ""
             LAST_LLM_ERROR["msg"] = f"LLM HTTP {e.code}: {detail}"
+            RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
             app.logger.warning(LAST_LLM_ERROR["msg"])
             if e.code == 429:
                 time.sleep(1)
             q.put((None, None))
         except Exception as e:
             LAST_LLM_ERROR["msg"] = f"LLM error: {type(e).__name__}: {str(e)[:150]}"
+            RECENT_ERRORS.append(LAST_LLM_ERROR["msg"][:200]); del RECENT_ERRORS[:-5]
             app.logger.warning(LAST_LLM_ERROR["msg"])
             q.put((None, None))
 
@@ -1068,8 +1072,15 @@ SELFTEST_BODY = {
 def selftest():
     """Free check of the model connection. Expect rootCause bad_deployment, effect rollback_deployment on deploy-8841."""
     need(SELFTEST_ON, "Not found.", 404)
-    ctx = validate_incident_request(copy.deepcopy(SELFTEST_BODY))
+    body = copy.deepcopy(SELFTEST_BODY)
+    big = request.args.get("big") == "1"
+    if big:  # ~13k tokens of filler, like a real grader incident
+        noise = [f"[ev_{i:04d}] 09:{i % 60:02d} worker-{i % 17} reported routine housekeeping, queue depth nominal, no anomalies seen on host {i}."
+                 for i in range(100, 700)]
+        body["incident"]["transcript"] += "\n" + "\n".join(noise)
+    ctx = validate_incident_request(body)
     t0 = time.time()
+    used_fallback = False
     try:
         plan, _, _ = plan_incident(ctx, time.time() + REQUEST_BUDGET)
         out = {"ok": True, "rootCause": plan["rootCause"], "evidence": plan["evidence"],
@@ -1080,7 +1091,9 @@ def selftest():
     except Bad as e:
         out = {"ok": False, "problem": e.message}
     out.update({"keySet": bool(LLM_API_KEY), "model": MODEL_NAME, "seconds": round(time.time() - t0, 1),
-                "lastError": LAST_LLM_ERROR["msg"]})
+                "lastError": LAST_LLM_ERROR["msg"],
+                "recentErrors": RECENT_ERRORS, "big": big, "build": BUILD,
+                "promptChars": len(render_prompt(ctx))})
     return jraw(json.dumps(out))
 
 
